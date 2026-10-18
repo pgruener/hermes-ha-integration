@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, AsyncGenerator
 
@@ -12,10 +14,12 @@ import aiohttp
 
 from .compat import normalize_host, normalize_profile, normalize_profile_route
 from .const import (
+    API_CAPABILITIES,
     API_CHAT_COMPLETIONS,
     API_HEALTH,
     API_HEALTH_DETAILED,
     API_MODELS,
+    API_RUNS,
     DEFAULT_MODEL,
     DEFAULT_STREAM_TIMEOUT,
     DEFAULT_TIMEOUT,
@@ -28,6 +32,7 @@ from .const import (
     ERROR_CATEGORY_UNSUPPORTED,
     HEALTH_STATUSES,
     REDIRECT_STATUS_CODES,
+    SPLIT_RUNTIME_CAPABILITY_TTL_SECONDS,
     UNSUPPORTED_DETAILED_STATUS_CODES,
     ProfileRouteFamily,
 )
@@ -73,6 +78,30 @@ class HermesApiResult:
 
     text: str
     session_id: str | None
+
+
+@dataclass(slots=True, frozen=True)
+class HermesClientToolCall:
+    """A split-runtime tool call Hermes relayed for local execution."""
+
+    call_id: str
+    name: str
+    arguments: dict[str, Any]
+
+
+@dataclass(slots=True, frozen=True)
+class HermesClientToolResult:
+    """Outcome of a locally executed split-runtime tool call."""
+
+    output: Any
+    error: bool = False
+
+
+ClientToolExecutor = Callable[[HermesClientToolCall], Awaitable[HermesClientToolResult]]
+
+_RUN_TERMINAL_FAILURES = frozenset(
+    {"run.failed", "run.cancelled", "run.interrupted"}
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -129,6 +158,7 @@ class HermesApiClient:
         # ssl=False disables certificate verification (for self-signed certs)
         self._ssl: bool | None = None if not use_ssl else (None if verify_ssl else False)
         self._last_session_id: str | None = None
+        self._split_runtime_cache: tuple[bool, float] | None = None
 
     @property
     def base_url(self) -> str:
@@ -491,6 +521,210 @@ class HermesApiClient:
                 error_category=_transport_error_category(err),
             ) from err
 
+    async def async_split_runtime_available(self) -> bool:
+        """Return whether the selected route advertises split-runtime client tools."""
+        now = time.monotonic()
+        if self._split_runtime_cache is not None:
+            available, checked_at = self._split_runtime_cache
+            if now - checked_at < SPLIT_RUNTIME_CAPABILITY_TTL_SECONDS:
+                return available
+
+        available = False
+        try:
+            await self._async_verify_native_profile_route()
+            async with self._session.get(
+                f"{self._base_url}{API_CAPABILITIES}",
+                headers=self._headers(),
+                timeout=aiohttp.ClientTimeout(total=10),
+                ssl=self._ssl,
+                allow_redirects=False,
+            ) as resp:
+                if resp.status == 200:
+                    payload = await resp.json()
+                    runtime = payload.get("runtime") if isinstance(payload, dict) else None
+                    available = (
+                        isinstance(runtime, dict)
+                        and runtime.get("split_runtime") is True
+                    )
+        except (HermesApiError, aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            _LOGGER.debug("Hermes capabilities probe failed", exc_info=True)
+
+        self._split_runtime_cache = (available, now)
+        return available
+
+    async def async_stream_run(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        tools: list[dict[str, Any]],
+        execute_tool: ClientToolExecutor,
+        session_id: str | None = None,
+    ) -> AsyncGenerator[str, None]:
+        """Run one turn via /v1/runs with client tools. Yields content deltas.
+
+        Tool calls Hermes relays as ``tool_call.request`` are executed through
+        ``execute_tool`` and answered on ``/v1/runs/{run_id}/tool_result``.
+        """
+        await self._async_verify_native_profile_route()
+        body: dict[str, Any] = {"model": self._model, "tools": tools}
+        body.update(_split_run_messages(messages))
+        if session_id:
+            body["session_id"] = session_id
+
+        try:
+            async with self._session.post(
+                f"{self._base_url}{API_RUNS}",
+                headers=self._headers(),
+                json=body,
+                timeout=aiohttp.ClientTimeout(total=self._request_timeout),
+                ssl=self._ssl,
+            ) as resp:
+                if resp.status in (401, 403):
+                    raise HermesAuthError("Invalid API key")
+                if resp.status == 400:
+                    # Admission validation (e.g. a tool name reserved by Hermes):
+                    # the run was never started, so a plain chat retry is safe.
+                    raise HermesStreamSetupError("Hermes rejected the split-runtime run")
+                if resp.status >= 400:
+                    raise self._classify_status_error(resp.status)
+                admission = await resp.json()
+        except HermesApiError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            raise HermesConnectionError(
+                "Connection error",
+                error_category=_transport_error_category(err),
+            ) from err
+
+        run_id = admission.get("run_id") if isinstance(admission, dict) else None
+        if not isinstance(run_id, str) or not run_id:
+            raise HermesConnectionError(
+                "Hermes run admission returned no run_id",
+                error_category=ERROR_CATEGORY_MALFORMED,
+            )
+        # Without an explicit session_id Hermes keys the new session by run_id.
+        self._last_session_id = session_id or run_id
+
+        finished = False
+        yielded_content = False
+        try:
+            async for event in self._async_iter_run_events(run_id):
+                event_name = event.get("event")
+                if event_name == "message.delta":
+                    delta = event.get("delta")
+                    if isinstance(delta, str) and delta:
+                        yielded_content = True
+                        yield delta
+                elif event_name == "tool_call.request":
+                    await self._async_answer_tool_call(run_id, event, execute_tool)
+                elif event_name == "run.completed":
+                    finished = True
+                    output = event.get("output")
+                    if not yielded_content and isinstance(output, str) and output:
+                        yield output
+                    return
+                elif event_name in _RUN_TERMINAL_FAILURES:
+                    finished = True
+                    raise HermesConnectionError(
+                        "Hermes API reported an incomplete run",
+                        error_category=ERROR_CATEGORY_SERVER,
+                    )
+            raise HermesConnectionError("Run stream ended without a terminal event")
+        except HermesApiError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise HermesConnectionError(
+                "Run stream connection error",
+                error_category=_transport_error_category(err),
+            ) from err
+        finally:
+            if not finished:
+                await self._async_stop_run(run_id)
+
+    async def _async_iter_run_events(
+        self, run_id: str
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Yield JSON payloads from the run's SSE stream until it closes."""
+        async with self._session.get(
+            f"{self._base_url}{API_RUNS}/{run_id}/events",
+            headers={**self._headers(), "Accept": "text/event-stream"},
+            timeout=aiohttp.ClientTimeout(
+                total=self._stream_timeout,
+                sock_read=self._request_timeout,
+            ),
+            ssl=self._ssl,
+        ) as resp:
+            if resp.status in (401, 403):
+                raise HermesAuthError("Invalid API key")
+            if resp.status >= 400:
+                raise self._classify_status_error(resp.status)
+
+            buffer = ""
+            async for chunk in resp.content.iter_any():
+                buffer += chunk.decode("utf-8", errors="replace")
+                while "\n" in buffer:
+                    line, buffer = buffer.split("\n", 1)
+                    line = line.strip()
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        payload = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+                    if isinstance(payload, dict):
+                        yield payload
+
+    async def _async_answer_tool_call(
+        self,
+        run_id: str,
+        event: dict[str, Any],
+        execute_tool: ClientToolExecutor,
+    ) -> None:
+        call_id = event.get("call_id")
+        name = event.get("name")
+        if not isinstance(call_id, str) or not isinstance(name, str):
+            raise HermesConnectionError(
+                "Hermes relayed a malformed client tool call",
+                error_category=ERROR_CATEGORY_MALFORMED,
+            )
+        arguments = event.get("arguments")
+        call = HermesClientToolCall(
+            call_id=call_id,
+            name=name,
+            arguments=arguments if isinstance(arguments, dict) else {},
+        )
+        result = await execute_tool(call)
+        async with self._session.post(
+            f"{self._base_url}{API_RUNS}/{run_id}/tool_result",
+            headers=self._headers(),
+            json={"call_id": call_id, "output": result.output, "error": result.error},
+            timeout=aiohttp.ClientTimeout(total=self._request_timeout),
+            ssl=self._ssl,
+        ) as resp:
+            if resp.status in (401, 403):
+                raise HermesAuthError("Invalid API key")
+            if resp.status == 409:
+                # The relay already expired or was cancelled; the run stream
+                # reports how the turn ends.
+                _LOGGER.warning("Hermes no longer awaits client tool call %s", name)
+                return
+            if resp.status >= 400:
+                raise self._classify_status_error(resp.status)
+
+    async def _async_stop_run(self, run_id: str) -> None:
+        """Best-effort stop so Hermes does not wait for an abandoned tool result."""
+        try:
+            async with self._session.post(
+                f"{self._base_url}{API_RUNS}/{run_id}/stop",
+                headers=self._headers(),
+                json={},
+                timeout=aiohttp.ClientTimeout(total=5),
+                ssl=self._ssl,
+            ):
+                pass
+        except Exception:
+            _LOGGER.debug("Stopping Hermes run %s failed", run_id, exc_info=True)
+
     @staticmethod
     def _extract_content(data: dict[str, Any]) -> str:
         """Extract the assistant message content from a chat completion response."""
@@ -498,6 +732,20 @@ class HermesApiClient:
             return data["choices"][0]["message"]["content"]
         except (KeyError, IndexError):
             return data.get("error", {}).get("message", "(No response)")
+
+
+def _split_run_messages(messages: list[dict[str, str]]) -> dict[str, Any]:
+    """Map chat messages onto /v1/runs ``instructions``/``conversation_history``/``input``."""
+    system_parts = [m["content"] for m in messages if m.get("role") == "system" and m.get("content")]
+    turns = [m for m in messages if m.get("role") != "system"]
+    fields: dict[str, Any] = {"input": turns[-1]["content"] if turns else ""}
+    if system_parts:
+        fields["instructions"] = "\n\n".join(system_parts)
+    if len(turns) > 1:
+        fields["conversation_history"] = [
+            {"role": m["role"], "content": m["content"]} for m in turns[:-1]
+        ]
+    return fields
 
 
 def _chat_completion_failed(data: Any) -> bool:

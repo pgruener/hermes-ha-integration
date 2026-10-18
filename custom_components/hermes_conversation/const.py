@@ -36,6 +36,8 @@ CONF_EXPOSE_DEVICE_CONTEXT = "expose_device_context"
 CONF_ALWAYS_SPEAK_FALLBACK = "always_speak_fallback"
 CONF_FALLBACK_MEDIA_PLAYER = "fallback_media_player"
 CONF_FALLBACK_TTS_ENGINE = "fallback_tts_engine"
+# Same key as homeassistant.const.CONF_LLM_HASS_API.
+CONF_LLM_HASS_API = "llm_hass_api"
 
 # Legacy config keys still found in existing local installs.
 LEGACY_CONF_API_BASE_URL = "api_base_url"
@@ -95,6 +97,10 @@ API_CHAT_COMPLETIONS = "/v1/chat/completions"
 API_MODELS = "/v1/models"
 API_HEALTH = "/v1/health"
 API_HEALTH_DETAILED = "/health/detailed"
+API_CAPABILITIES = "/v1/capabilities"
+API_RUNS = "/v1/runs"
+
+SPLIT_RUNTIME_CAPABILITY_TTL_SECONDS = 60
 
 DIAGNOSTICS_SCAN_INTERVAL_SECONDS = 60
 HEALTH_STATUS_OK = "ok"

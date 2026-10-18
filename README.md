@@ -78,6 +78,7 @@ After setup, all settings can be changed via **Settings â†’ Devices & Services â
 | Use HTTPS                                | Yes                 | Connect via HTTPS                                                                      |
 | Verify SSL certificate                   | No                  | Verify the SSL certificate (disable for self-signed)                                   |
 | System Prompt                            | (built-in)          | Jinja2 template; empty omits custom context, but speech-format guidance still applies                         |
+| Let Hermes control Home Assistant        | (none)              | Home Assistant LLM APIs (e.g. Assist) whose tools Hermes may call via split runtime; see below |
 | Include exposed entities                 | No                  | Include smart home device states in the system prompt                                  |
 | Max context characters                   | 12000               | Character limit for the entity context block                                           |
 | Follow-up listening                      | Off                 | Off, always on, or automatic only when Hermes asks a follow-up question                 |
@@ -100,6 +101,23 @@ The value is not a filesystem path: do not enter a directory, `/profile/worker`,
 If your installed integration version does not show the **Profile** field yet, the immediate workaround is to make the desired profile primary in the add-on, then leave the integration's profile blank. After updating to a version with profile routing, select each profile through its own integration entry and assign that entry to the desired Home Assistant Assist agent.
 
 The default system prompt includes the current date/time, timezone, the user's name, the home name, and exposed entity names, aliases, domains, areas, and states (if enabled). Entity exposure is off by default since Hermes Agent can access Home Assistant entities directly when a Home Assistant token is configured in the Hermes Agent add-on.
+
+### Home Assistant tools via split runtime
+
+By default Hermes executes every tool on its own host. With **Let Hermes control Home Assistant** set to one or more LLM APIs (usually **Assist**) and a Hermes route that runs [split runtime](https://github.com/NousResearch/hermes-agent/pull/63966), Hermes plans the turn with its own skills and memory while Home Assistant executes its tools locally:
+
+1. The integration sends the turn to `POST /v1/runs` with the tools of the selected LLM API (exposed entities, intents, and exposed scripts).
+2. When the model calls one, Hermes pauses and emits `tool_call.request` on the run's event stream.
+3. Home Assistant runs the tool and returns the result to `POST /v1/runs/{run_id}/tool_result`; Hermes continues and the reply is streamed to TTS.
+
+Enable split runtime for the profile in Hermes:
+
+```yaml
+api_server:
+  split_runtime: true
+```
+
+The integration checks `GET /v1/capabilities` (`runtime.split_runtime`) and falls back to the plain chat endpoint without tools when the route does not advertise it or Hermes rejects the run before starting it. Expose a script to Assist to give Hermes a device action it cannot otherwise express, for example a `script.play_radio` that takes a station ID and calls `media_player.play_media`.
 
 ### Voice continuity modes
 

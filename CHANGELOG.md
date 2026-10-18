@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Optional **Let Hermes control Home Assistant** setting: when the selected Hermes route advertises split runtime (`/v1/capabilities` → `runtime.split_runtime`), turns run through `/v1/runs` with the selected Home Assistant LLM API tools. Hermes keeps its skills and memory, relays tool calls as `tool_call.request`, and Home Assistant executes them locally before Hermes continues. Without the setting, or on routes without split runtime, behavior is unchanged.
+
 ## [1.4.0] - 2026-10-12
 
 ### Added

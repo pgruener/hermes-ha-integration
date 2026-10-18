@@ -45,6 +45,7 @@ from .const import (
     CONF_FALLBACK_TTS_ENGINE,
     CONF_HOST,
     CONF_INCLUDE_EXPOSED_ENTITIES,
+    CONF_LLM_HASS_API,
     CONF_PORT,
     CONF_PROFILE,
     CONF_PROFILE_ROUTE,
@@ -89,6 +90,18 @@ _PROFILE_ROUTE_OPTIONS = [
         label="Native Hermes multiplexer (/p/<name>)",
     ),
 ]
+
+
+def _llm_api_options(hass: Any) -> list[SelectOptionDict]:
+    """Return the Home Assistant LLM APIs a split-runtime Hermes can call."""
+    try:
+        from homeassistant.helpers import llm  # noqa: PLC0415
+    except ImportError:
+        return []
+    return [
+        SelectOptionDict(label=api.name, value=api.id)
+        for api in llm.async_get_apis(hass)
+    ]
 
 
 def _entry_title(profile: str) -> str:
@@ -488,6 +501,17 @@ class HermesConversationOptionsFlow(OptionsFlow):
                     return self.async_create_entry(title="", data=None)
 
         connection = resolve_connection_config(self.config_entry)
+        llm_api_options = _llm_api_options(self.hass)
+        llm_api_field: dict[Any, Any] = {}
+        if llm_api_options:
+            llm_api_field[
+                vol.Optional(
+                    CONF_LLM_HASS_API,
+                    default=entry_value(self.config_entry, CONF_LLM_HASS_API, []),
+                )
+            ] = SelectSelector(
+                SelectSelectorConfig(options=llm_api_options, multiple=True)
+            )
 
         return self.async_show_form(
             step_id="init",
@@ -534,6 +558,7 @@ class HermesConversationOptionsFlow(OptionsFlow):
                             legacy_keys=(LEGACY_CONF_INSTRUCTIONS,),
                         ),
                     ): TextSelector(TextSelectorConfig(multiline=True)),
+                    **llm_api_field,
                     vol.Optional(
                         CONF_INCLUDE_EXPOSED_ENTITIES,
                         default=entry_value(

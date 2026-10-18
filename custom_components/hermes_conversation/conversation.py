@@ -41,6 +41,7 @@ from .const import (
     CONF_FALLBACK_MEDIA_PLAYER,
     CONF_FALLBACK_TTS_ENGINE,
     CONF_INCLUDE_EXPOSED_ENTITIES,
+    CONF_LLM_HASS_API,
     CONF_PROMPT,
     CONF_SESSION_TIMEOUT_SECONDS,
     DEFAULT_ALWAYS_SPEAK_FALLBACK,
@@ -58,6 +59,7 @@ from .const import (
     FOLLOW_UP_MODE_AUTO,
     LEGACY_CONF_INSTRUCTIONS,
 )
+from .llm_tools import SplitRuntimeTurn, build_split_runtime_turn
 from .speech import SpeechEmojiFilter, SpeechMarkdownFilter, strip_speech_emoji
 
 try:
@@ -448,6 +450,13 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         if extra:
             system_prompt = (system_prompt + "\n\n" + extra) if system_prompt else extra
 
+        split_turn = await self._async_prepare_split_runtime(user_input, chat_log)
+        if split_turn and split_turn.api_prompt:
+            system_prompt = (
+                f"{system_prompt}\n\n{split_turn.api_prompt}"
+                if system_prompt else split_turn.api_prompt
+            )
+
         # Append origin context when requested
         if self._device_context_enabled():
             context_lines = self._build_origin_context(user_input)
@@ -487,6 +496,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
                     messages,
                     session_id=session_id,
                     request_state=request_state,
+                    split_turn=split_turn,
                 )
             spoken_text = _sanitize_text_for_speech(response_text)
         except HermesApiError as err:
@@ -541,6 +551,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         messages: list[dict[str, str]],
         session_id: str | None = None,
         request_state: dict[str, Any] | None = None,
+        split_turn: SplitRuntimeTurn | None = None,
     ) -> str:
         """Stream safe assistant deltas into Home Assistant's chat log."""
         chunks: list[str] = []
@@ -549,7 +560,7 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             started = False
             try:
                 async for chunk in self._iter_voice_safe_response(
-                    messages, session_id=session_id
+                    messages, session_id=session_id, split_turn=split_turn
                 ):
                     if not chunk:
                         continue
@@ -593,15 +604,23 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
         self,
         messages: list[dict[str, str]],
         session_id: str | None = None,
+        split_turn: SplitRuntimeTurn | None = None,
     ) -> AsyncIterator[str]:
         """Yield speech-safe assistant text chunks from Hermes streaming."""
         speech_filter = _UnsafeSpeechStreamFilter()
         stream_started = False
+        if split_turn is not None:
+            source = self.client.async_stream_run(
+                messages,
+                tools=split_turn.tools,
+                execute_tool=split_turn.execute_tool,
+                session_id=session_id,
+            )
+        else:
+            source = self.client.async_stream_message(messages, session_id=session_id)
 
         try:
-            async for chunk in self.client.async_stream_message(
-                messages, session_id=session_id
-            ):
+            async for chunk in source:
                 stream_started = True
                 if safe_chunk := speech_filter.feed(chunk):
                     yield safe_chunk
@@ -627,6 +646,36 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
     def _agent_id(self) -> str:
         """Return the best available Home Assistant agent identifier."""
         return getattr(self, "entity_id", None) or self.entry.entry_id
+
+    async def _async_prepare_split_runtime(
+        self,
+        user_input: ConversationInput,
+        chat_log: ChatLog | None,
+    ) -> SplitRuntimeTurn | None:
+        """Offer the selected HA LLM API tools to Hermes when it supports split runtime."""
+        llm_api_ids = entry_value(self.entry, CONF_LLM_HASS_API, [])
+        if not llm_api_ids or chat_log is None:
+            return None
+        provide_llm_data = getattr(chat_log, "async_provide_llm_data", None)
+        as_llm_context = getattr(user_input, "as_llm_context", None)
+        if provide_llm_data is None or as_llm_context is None:
+            _LOGGER.debug("Home Assistant is too old to expose LLM tools to Hermes")
+            return None
+        if not await self.client.async_split_runtime_available():
+            _LOGGER.debug("Hermes route does not advertise split runtime; tools disabled")
+            return None
+        try:
+            await provide_llm_data(
+                as_llm_context(DOMAIN),
+                llm_api_ids,
+                None,
+                getattr(user_input, "extra_system_prompt", None),
+            )
+        except Exception as err:  # noqa: BLE001 - degrade to a tool-less turn
+            _LOGGER.warning("Could not prepare Home Assistant LLM tools: %s", err)
+            return None
+        llm_api = getattr(chat_log, "llm_api", None)
+        return build_split_runtime_turn(llm_api) if llm_api is not None else None
 
     async def _get_response(
         self,
