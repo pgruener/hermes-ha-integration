@@ -675,7 +675,12 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
             _LOGGER.warning("Could not prepare Home Assistant LLM tools: %s", err)
             return None
         llm_api = getattr(chat_log, "llm_api", None)
-        return build_split_runtime_turn(llm_api) if llm_api is not None else None
+        split_turn = build_split_runtime_turn(llm_api) if llm_api is not None else None
+        _LOGGER.debug(
+            "Offering Home Assistant tools to Hermes: %s",
+            [tool["function"]["name"] for tool in split_turn.tools] if split_turn else [],
+        )
+        return split_turn
 
     async def _get_response(
         self,
