@@ -654,7 +654,10 @@ class HermesConversationAgent(ConversationEntity, AbstractConversationAgent):
     ) -> SplitRuntimeTurn | None:
         """Offer the selected HA LLM API tools to Hermes when it supports split runtime."""
         llm_api_ids = entry_value(self.entry, CONF_LLM_HASS_API, [])
-        if not llm_api_ids or chat_log is None:
+        if not llm_api_ids:
+            _LOGGER.debug("No Home Assistant LLM API selected; Hermes gets no tools")
+            return None
+        if chat_log is None:
             return None
         provide_llm_data = getattr(chat_log, "async_provide_llm_data", None)
         as_llm_context = getattr(user_input, "as_llm_context", None)
